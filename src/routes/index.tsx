@@ -103,6 +103,7 @@ function Index() {
   const doUpload = useServerFn(uploadImage);
   const doCreate = useServerFn(createAd);
   const doFetchTokens = useServerFn(fetchSessionTokens);
+  const doParseInput = useServerFn(parseInput);
 
   const previews = useMemo(
     () => files.map((f) => ({ name: f.name, url: URL.createObjectURL(f) })),
@@ -111,54 +112,71 @@ function Index() {
 
   async function importCookies() {
     const raw = cookieInput.trim();
-    // Normalize: accept ; or , or newlines as separators
-    const normalized = raw.replace(/[\r\n]+/g, ";").replace(/,(?=\s*[A-Za-z_][A-Za-z0-9_-]*=)/g, ";");
-    const map: Record<string, string> = {};
-    for (const part of normalized.split(";")) {
-      const t = part.trim();
-      if (!t) continue;
-      const i = t.indexOf("=");
-      if (i > 0) {
-        const k = t.slice(0, i).trim();
-        const v = t.slice(i + 1).trim();
-        if (k && v) map[k] = v;
-      }
-    }
-    const uid = map["c_user"];
-    if (!uid) {
-      setNotice({ kind: "err", text: "لم نجد c_user داخل الكوكيز — تأكد من نسخها كاملة." });
+    if (!raw) {
+      setNotice({ kind: "err", text: "الصق الكوكيز أو أمر curl أو رابط مدير الإعلانات أولاً." });
       return;
     }
-    // rebuild a clean cookie string with essential keys first
-    const essential = ["c_user", "xs", "fr", "datr", "sb", "dpr", "wd", "locale", "presence", "ps_l", "ps_n"];
-    const parts: string[] = [];
-    for (const k of essential) if (map[k]) parts.push(`${k}=${map[k]}`);
-    for (const [k, v] of Object.entries(map)) if (!essential.includes(k)) parts.push(`${k}=${v}`);
-    const cookieString = parts.join("; ");
 
-    let dtsg = map["fb_dtsg"] ?? map["dtsg"] ?? "";
-    let lsd = map["lsd"] ?? null;
-    let jazoest: string | null = dtsg
-      ? "2" + [...dtsg].reduce((s, ch) => s + ch.charCodeAt(0), 0).toString()
-      : null;
+    setNotice({ kind: "warn", text: "جارٍ تحليل المُدخل واستخراج التوكنات..." });
 
-    setNotice({ kind: "warn", text: "جارٍ استخراج fb_dtsg من الجلسة..." });
+    // Universal parse (server, to reuse the same logic and avoid client bundle bloat)
+    let parsed;
     try {
-      const r = await doFetchTokens({ data: { cookieString, uid } });
-      if (r.success && r.dtsg) {
-        dtsg = r.dtsg;
-        lsd = r.lsd ?? lsd;
-        jazoest = r.jazoest ?? jazoest;
-      }
-    } catch {
-      /* fallback below */
+      parsed = await doParseInput({ data: { raw } });
+    } catch (e) {
+      setNotice({ kind: "err", text: `فشل تحليل المُدخل: ${String(e)}` });
+      return;
+    }
+
+    const uid = parsed.uid;
+    const cookieString = parsed.cookieString;
+
+    // Auto-fill IDs if the paste contained ads-manager URLs
+    if (parsed.act || parsed.pageId || parsed.businessId) {
+      setIds((prev) => ({
+        act: parsed.act ?? prev.act,
+        page_id: parsed.pageId ?? prev.page_id,
+        business_id: parsed.businessId ?? prev.business_id,
+      }));
+    }
+
+    if (!cookieString || !uid) {
+      setNotice({
+        kind: "err",
+        text: "لم نجد كوكيز صالحة (نحتاج c_user على الأقل). الصق الكوكيز كاملة أو أمر curl من DevTools.",
+      });
+      return;
+    }
+
+    let dtsg = parsed.dtsg ?? "";
+    let lsd = parsed.lsd ?? null;
+    let jazoest = parsed.jazoest ?? null;
+    let source = dtsg ? "من المُدخل مباشرة" : "";
+
+    // If dtsg wasn't already in the paste, fetch it from a live FB page
+    if (!dtsg) {
+      try {
+        const r = await doFetchTokens({ data: { cookieString, uid } });
+        if (r.success && r.dtsg) {
+          dtsg = r.dtsg;
+          lsd = r.lsd ?? lsd;
+          jazoest = r.jazoest ?? jazoest;
+          source = "من الجلسة الحية";
+        }
+      } catch { /* fall through */ }
     }
 
     setCreds({ uid, dtsg, jazoest, lsd, cookieString });
     if (dtsg) {
-      setNotice({ kind: "ok", text: `تم الاستيراد بنجاح — UID: ${uid} — fb_dtsg مستخرج تلقائياً ✓` });
+      setNotice({
+        kind: "ok",
+        text: `تم الاستيراد ✓ — UID: ${uid} — fb_dtsg ${source} — lsd: ${lsd ? "✓" : "—"} — jazoest: ${jazoest ?? "—"}`,
+      });
     } else {
-      setNotice({ kind: "warn", text: "تعذّر استخراج fb_dtsg تلقائياً — أضفه يدوياً بالأسفل أو تحقق من صلاحية الكوكيز." });
+      setNotice({
+        kind: "warn",
+        text: "تم حفظ الكوكيز لكن fb_dtsg لم يُستخرج تلقائياً. الصق قيمته يدوياً بالأسفل، أو أعد تسجيل الدخول لفيسبوك.",
+      });
     }
   }
 
