@@ -206,25 +206,40 @@ export const parseInput = createServerFn({ method: "POST" })
 export const fetchSessionTokens = createServerFn({ method: "POST" })
   .inputValidator((d) => z.object({ cookieString: z.string().min(1), uid: z.string().optional() }).parse(d))
   .handler(async ({ data }) => {
+    const browserHeaders: Record<string, string> = {
+      cookie: data.cookieString,
+      "user-agent": UA,
+      "accept-language": "en-US,en;q=0.9",
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "upgrade-insecure-requests": "1",
+      "sec-fetch-dest": "document",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-site": "none",
+      "sec-fetch-user": "?1",
+      "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": '"Windows"',
+    };
     const pages = [
+      // mbasic serves plain HTML with hidden <input name="fb_dtsg"> — easiest to parse
+      "https://mbasic.facebook.com/",
+      "https://mbasic.facebook.com/settings",
+      "https://m.facebook.com/",
+      "https://m.facebook.com/settings",
       "https://www.facebook.com/ads/manager/account_settings/information/",
       "https://www.facebook.com/business_center/",
-      "https://www.facebook.com/",
-      "https://m.facebook.com/",
+      "https://www.facebook.com/me",
+      "https://www.facebook.com/settings",
       "https://web.facebook.com/settings",
     ];
     let lastLen = 0;
+    let lastStatus = 0;
+    let redirectedToLogin = false;
     for (const url of pages) {
       try {
-        const res = await fetch(url, {
-          headers: {
-            cookie: data.cookieString,
-            "user-agent": UA,
-            "accept-language": "en-US,en;q=0.9",
-            accept: "text/html,application/xhtml+xml",
-          },
-          redirect: "follow",
-        });
+        const res = await fetch(url, { headers: browserHeaders, redirect: "follow" });
+        lastStatus = res.status;
+        if (res.redirected && /login|checkpoint/.test(res.url)) redirectedToLogin = true;
         const html = await res.text();
         lastLen = html.length;
         const { dtsg, lsd } = extractFromHtml(html);
@@ -236,12 +251,15 @@ export const fetchSessionTokens = createServerFn({ method: "POST" })
         /* try next */
       }
     }
+    const hint = redirectedToLogin
+      ? "فيسبوك حوّل الطلب لصفحة تسجيل الدخول — الكوكيز غير صالحة أو ناقصة (لازم c_user و xs كاملين)."
+      : "فيسبوك لم يُرجع الصفحة الكاملة لطلب السيرفر. انسخ fb_dtsg يدوياً: افتح فيسبوك، اضغط F12 ← Console واكتب require('DTSG').getToken() أو الصق مصدر الصفحة (Ctrl+U) هنا.";
     return {
       success: false,
       dtsg: null,
       lsd: null,
       jazoest: null,
-      error: `تعذّر استخراج fb_dtsg من الجلسة (تم تحميل ${lastLen} حرف). تأكد أن الكوكيز نشطة وتشمل c_user و xs.`,
+      error: `تعذّر استخراج fb_dtsg تلقائياً (HTTP ${lastStatus}، ${lastLen} حرف). ${hint}`,
     };
   });
 
