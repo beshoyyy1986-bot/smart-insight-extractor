@@ -11,6 +11,9 @@ const credsSchema = z.object({
 
 type Creds = z.infer<typeof credsSchema>;
 
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
 function baseParams(c: Creds) {
   const p: Record<string, string> = {
     av: c.uid,
@@ -28,8 +31,7 @@ function baseParams(c: Creds) {
 function fbHeaders(c: Creds) {
   return {
     cookie: c.cookieString,
-    "user-agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "user-agent": UA,
     "x-fb-lsd": c.lsd ?? "",
     origin: "https://www.facebook.com",
     referer: "https://www.facebook.com/",
@@ -53,70 +55,194 @@ function parseFbResponse(text: string) {
   return result;
 }
 
-function extractFromHtml(html: string) {
-  let dtsg: string | null = null;
-  let lsd: string | null = null;
+// ─── Universal input parser ────────────────────────────────────────────────
+// Accepts: raw cookie string, curl command, HTTP request paste, JSON, or
+// any blob that happens to contain the tokens we need. Returns whatever we
+// can identify. Nothing is required.
+export function parseAnyInput(raw: string): {
+  cookieString: string | null;
+  uid: string | null;
+  dtsg: string | null;
+  lsd: string | null;
+  jazoest: string | null;
+  act: string | null;
+  pageId: string | null;
+  businessId: string | null;
+} {
+  const out = {
+    cookieString: null as string | null,
+    uid: null as string | null,
+    dtsg: null as string | null,
+    lsd: null as string | null,
+    jazoest: null as string | null,
+    act: null as string | null,
+    pageId: null as string | null,
+    businessId: null as string | null,
+  };
+  if (!raw || !raw.trim()) return out;
 
-  // 1) JSON token patterns
-  const patterns: RegExp[] = [
-    /"dtsg"\s*:\s*\{\s*"token"\s*:\s*"([^"]+)"/,
-    /"token"\s*:\s*"(NAc[^"\\]{10,})"/,
-    /\\"dtsg\\":\{\\"token\\":\\"([^"\\]+)\\"/,
-    /fb_dtsg[^"']{0,20}["']value["']?\s*[:,]\s*["']([^"']+)["']/,
-    /name="fb_dtsg"[^>]*value="([^"]+)"/,
-    /DTSGInitialData[^}]*"token"\s*:\s*"([^"]+)"/,
-    /"dtsg_token"\s*:\s*"([^"]+)"/,
-  ];
-  for (const re of patterns) {
-    const m = html.match(re);
-    if (m?.[1]) { dtsg = m[1].replace(/\\\//g, "/"); break; }
+  const text = raw.trim();
+
+  // 1) Try to find a Cookie: header inside a curl/HTTP paste
+  const cookieHeaderRe = /(?:^|\n|\s|-H\s*['"]|--header\s*['"]|-b\s*['"])[Cc]ookie:\s*([^'"\n\r]+)['"]?/;
+  const cookieHeaderMatch = text.match(cookieHeaderRe);
+  let cookieRaw = cookieHeaderMatch?.[1] ?? null;
+
+  // 2) If no explicit header, use the whole input if it looks like cookies (contains c_user=)
+  if (!cookieRaw && /(^|[;\s])c_user=/.test(text)) {
+    cookieRaw = text;
   }
 
-  const lsdPatterns: RegExp[] = [
-    /"LSD"\s*:\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/,
-    /\\"LSD\\",\[\],\{\\"token\\":\\"([^"\\]+)\\"/,
-    /name="lsd"[^>]*value="([^"]+)"/,
-    /"lsd"\s*:\s*\{"token"\s*:\s*"([^"]+)"/,
-  ];
-  for (const re of lsdPatterns) {
-    const m = html.match(re);
-    if (m?.[1]) { lsd = m[1].replace(/\\\//g, "/"); break; }
+  if (cookieRaw) {
+    // Normalize separators
+    const normalized = cookieRaw.replace(/[\r\n]+/g, ";").replace(/,(?=\s*[A-Za-z_][A-Za-z0-9_-]*=)/g, ";");
+    const map: Record<string, string> = {};
+    for (const part of normalized.split(";")) {
+      const t = part.trim();
+      if (!t) continue;
+      const i = t.indexOf("=");
+      if (i > 0) {
+        const k = t.slice(0, i).trim();
+        const v = t.slice(i + 1).trim().replace(/^["']|["']$/g, "");
+        if (k && v && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(k)) map[k] = v;
+      }
+    }
+    if (Object.keys(map).length) {
+      const essential = ["c_user", "xs", "fr", "datr", "sb", "dpr", "wd", "locale", "presence", "ps_l", "ps_n"];
+      const parts: string[] = [];
+      for (const k of essential) if (map[k]) parts.push(`${k}=${map[k]}`);
+      for (const [k, v] of Object.entries(map)) if (!essential.includes(k)) parts.push(`${k}=${v}`);
+      out.cookieString = parts.join("; ");
+      if (map["c_user"]) out.uid = map["c_user"];
+      if (map["fb_dtsg"]) out.dtsg = map["fb_dtsg"];
+      if (map["lsd"]) out.lsd = map["lsd"];
+    }
   }
 
-  return { dtsg, lsd };
+  // 3) Scan the raw text for tokens (works for HTML pastes, JSON pastes, curl bodies)
+  if (!out.dtsg) {
+    const dtsgPatterns: RegExp[] = [
+      /"dtsg"\s*:\s*\{\s*"token"\s*:\s*"([^"]+)"/,
+      /\\"dtsg\\":\{\\"token\\":\\"([^"\\]+)\\"/,
+      /"token"\s*:\s*"(NAc[^"\\]{10,})"/,
+      /name=\\?"fb_dtsg\\?"\s+value=\\?"([^"\\]+)\\?"/,
+      /fb_dtsg["'\s:=]+([A-Za-z0-9:_\-]{20,})/,
+      /DTSGInitialData[^}]*"token"\s*:\s*"([^"]+)"/,
+      /"dtsg_token"\s*:\s*"([^"]+)"/,
+      /--data-raw\s+['"][^'"]*fb_dtsg=([^&'"\s]+)/,
+      /&fb_dtsg=([^&'"\s]+)/,
+      /\bfb_dtsg=([A-Za-z0-9:_\-%]+)/,
+    ];
+    for (const re of dtsgPatterns) {
+      const m = text.match(re);
+      if (m?.[1]) {
+        out.dtsg = decodeURIComponent(m[1].replace(/\\\//g, "/"));
+        break;
+      }
+    }
+  }
+
+  if (!out.lsd) {
+    const lsdPatterns: RegExp[] = [
+      /"LSD"\s*,\s*\[\]\s*,\s*\{\s*"token"\s*:\s*"([^"]+)"/,
+      /\\"LSD\\",\[\],\{\\"token\\":\\"([^"\\]+)\\"/,
+      /name=\\?"lsd\\?"\s+value=\\?"([^"\\]+)\\?"/,
+      /"lsd"\s*:\s*\{"token"\s*:\s*"([^"]+)"/,
+      /-H\s+['"]x-fb-lsd:\s*([^'"\s]+)/i,
+      /\blsd=([A-Za-z0-9_\-]+)/,
+    ];
+    for (const re of lsdPatterns) {
+      const m = text.match(re);
+      if (m?.[1]) { out.lsd = m[1]; break; }
+    }
+  }
+
+  if (!out.uid) {
+    const uidPatterns: RegExp[] = [
+      /"USER_ID"\s*:\s*"(\d{5,})"/,
+      /"actorID"\s*:\s*"(\d{5,})"/,
+      /"viewer_id"\s*:\s*"(\d{5,})"/,
+      /\bc_user=(\d{5,})/,
+      /\b__user=(\d{5,})/,
+      /"uid"\s*:\s*"?(\d{5,})/,
+    ];
+    for (const re of uidPatterns) {
+      const m = text.match(re);
+      if (m?.[1]) { out.uid = m[1]; break; }
+    }
+  }
+
+  if (!out.jazoest) {
+    const jm = text.match(/\bjazoest=(\d+)/);
+    if (jm?.[1]) out.jazoest = jm[1];
+  }
+  if (!out.jazoest && out.dtsg) {
+    out.jazoest = "2" + [...out.dtsg].reduce((s, ch) => s + ch.charCodeAt(0), 0).toString();
+  }
+
+  // 4) IDs from URLs
+  const actMatch = text.match(/act=(\d{5,})/);
+  if (actMatch?.[1]) out.act = actMatch[1];
+  const pageMatch =
+    text.match(/[?&]page_id=(\d{5,})/) ||
+    text.match(/facebook\.com\/(\d{5,})(?:[/?#]|$)/) ||
+    text.match(/"page_id"\s*:\s*"?(\d{5,})/);
+  if (pageMatch?.[1]) out.pageId = pageMatch[1];
+  const bizMatch = text.match(/[?&]business_id=(\d{5,})/) || text.match(/"business_id"\s*:\s*"?(\d{5,})/);
+  if (bizMatch?.[1]) out.businessId = bizMatch[1];
+
+  return out;
 }
+
+function extractFromHtml(html: string) {
+  const parsed = parseAnyInput(html);
+  return { dtsg: parsed.dtsg, lsd: parsed.lsd };
+}
+
+export const parseInput = createServerFn({ method: "POST" })
+  .inputValidator((d) => z.object({ raw: z.string().min(1) }).parse(d))
+  .handler(async ({ data }) => parseAnyInput(data.raw));
 
 export const fetchSessionTokens = createServerFn({ method: "POST" })
   .inputValidator((d) => z.object({ cookieString: z.string().min(1), uid: z.string().optional() }).parse(d))
   .handler(async ({ data }) => {
     const pages = [
+      "https://www.facebook.com/ads/manager/account_settings/information/",
+      "https://www.facebook.com/business_center/",
       "https://www.facebook.com/",
       "https://m.facebook.com/",
       "https://web.facebook.com/settings",
     ];
+    let lastLen = 0;
     for (const url of pages) {
       try {
         const res = await fetch(url, {
           headers: {
             cookie: data.cookieString,
-            "user-agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "user-agent": UA,
             "accept-language": "en-US,en;q=0.9",
+            accept: "text/html,application/xhtml+xml",
           },
           redirect: "follow",
         });
         const html = await res.text();
+        lastLen = html.length;
         const { dtsg, lsd } = extractFromHtml(html);
         if (dtsg) {
-          const jazoest =
-            "2" + [...dtsg].reduce((s, ch) => s + ch.charCodeAt(0), 0).toString();
+          const jazoest = "2" + [...dtsg].reduce((s, ch) => s + ch.charCodeAt(0), 0).toString();
           return { success: true, dtsg, lsd, jazoest, error: null };
         }
       } catch {
-        /* try next page */
+        /* try next */
       }
     }
-    return { success: false, dtsg: null, lsd: null, jazoest: null, error: "تعذّر استخراج fb_dtsg تلقائياً — تأكد من أن الجلسة نشطة." };
+    return {
+      success: false,
+      dtsg: null,
+      lsd: null,
+      jazoest: null,
+      error: `تعذّر استخراج fb_dtsg من الجلسة (تم تحميل ${lastLen} حرف). تأكد أن الكوكيز نشطة وتشمل c_user و xs.`,
+    };
   });
 
 export const uploadImage = createServerFn({ method: "POST" })
