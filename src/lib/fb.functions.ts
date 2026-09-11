@@ -28,14 +28,21 @@ function baseParams(c: Creds) {
   return p;
 }
 
-function fbHeaders(c: Creds) {
-  return {
+function fbHeaders(c: Creds, friendlyName?: string) {
+  const h: Record<string, string> = {
     cookie: c.cookieString,
     "user-agent": UA,
     "x-fb-lsd": c.lsd ?? "",
+    "x-asbd-id": "129477",
+    "x-fb-friendly-name": friendlyName ?? "",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-dest": "empty",
+    "accept-language": "en-US,en;q=0.9",
     origin: "https://www.facebook.com",
-    referer: "https://www.facebook.com/",
+    referer: "https://www.facebook.com/adsmanager/manage/campaigns",
   };
+  return h;
 }
 
 function parseFbResponse(text: string) {
@@ -280,39 +287,121 @@ export const uploadImage = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const c = data.credentials;
     const bytes = Uint8Array.from(atob(data.fileBase64), (ch) => ch.charCodeAt(0));
+    const mime = data.fileType || "image/jpeg";
+    const actNoPrefix = data.adAccountId.replace(/^act_/, "");
 
-    const form = new FormData();
-    const params = {
-      ...baseParams(c),
-      fb_api_req_friendly_name: "LWICometAdAccountUploadImageMutation",
-      variables: JSON.stringify({
-        input: {
-          ad_account_id: data.adAccountId,
-          hide_in_ad_image_library: false,
-          actor_id: c.uid,
-          client_mutation_id: "1",
-        },
-        imageWidth: data.width,
-        imageHeight: data.height,
-      }),
-      doc_id: "9778970048838259",
+    const extractHash = (parsed: any): string | null => {
+      if (!parsed) return null;
+      // GraphQL shapes
+      const g1 = parsed?.data?.ad_account_upload_image?.image?.image_hash;
+      const g2 = parsed?.data?.adAccountUploadImage?.image?.image_hash;
+      if (g1) return g1;
+      if (g2) return g2;
+      // REST /adimages shape: { images: { filename: { hash: "..." } } }
+      const imgs = parsed?.images;
+      if (imgs && typeof imgs === "object") {
+        for (const k of Object.keys(imgs)) {
+          const h = imgs[k]?.hash;
+          if (h) return h;
+        }
+      }
+      return null;
     };
-    for (const [k, v] of Object.entries(params)) form.append(k, v);
-    form.append("file", new Blob([bytes], { type: data.fileType || "image/jpeg" }), data.fileName);
 
-    const res = await fetch("https://www.facebook.com/api/graphql/", {
-      method: "POST",
-      headers: fbHeaders(c),
-      body: form,
-    });
-    const parsed = parseFbResponse(await res.text()) as any;
-    const imageHash =
-      parsed?.data?.ad_account_upload_image?.image?.image_hash ?? null;
+    const attempts: { name: string; status: number; body: string }[] = [];
 
+    // Attempt 1: GraphQL (current)
+    try {
+      const form = new FormData();
+      const params: Record<string, string> = {
+        ...baseParams(c),
+        fb_api_req_friendly_name: "LWICometAdAccountUploadImageMutation",
+        variables: JSON.stringify({
+          input: {
+            ad_account_id: data.adAccountId,
+            hide_in_ad_image_library: false,
+            actor_id: c.uid,
+            client_mutation_id: "1",
+          },
+          imageWidth: data.width,
+          imageHeight: data.height,
+        }),
+        doc_id: "9778970048838259",
+      };
+      for (const [k, v] of Object.entries(params)) form.append(k, v);
+      form.append("file", new Blob([bytes], { type: mime }), data.fileName);
+      const res = await fetch("https://www.facebook.com/api/graphql/", {
+        method: "POST",
+        headers: fbHeaders(c, "LWICometAdAccountUploadImageMutation"),
+        body: form,
+      });
+      const text = await res.text();
+      const parsed = parseFbResponse(text);
+      const hash = extractHash(parsed);
+      if (hash) return { success: true, imageHash: hash, error: null };
+      attempts.push({ name: "graphql", status: res.status, body: text.slice(0, 400) });
+    } catch (e: any) {
+      attempts.push({ name: "graphql", status: 0, body: String(e?.message ?? e) });
+    }
+
+    // Attempt 2: REST /act_{id}/adimages  (multipart, cookie-authed)
+    try {
+      const form = new FormData();
+      form.append("fb_dtsg", c.dtsg);
+      if (c.jazoest) form.append("jazoest", c.jazoest);
+      form.append("__user", c.uid);
+      form.append("__a", "1");
+      form.append("filename", new Blob([bytes], { type: mime }), data.fileName);
+      const res = await fetch(`https://www.facebook.com/api/graph/act_${actNoPrefix}/adimages`, {
+        method: "POST",
+        headers: fbHeaders(c, "AdsRESTUploadImage"),
+        body: form,
+      });
+      const text = await res.text();
+      let parsed: any = null;
+      try { parsed = JSON.parse(text); } catch { parsed = parseFbResponse(text); }
+      const hash = extractHash(parsed);
+      if (hash) return { success: true, imageHash: hash, error: null };
+      attempts.push({ name: "rest-adimages", status: res.status, body: text.slice(0, 400) });
+    } catch (e: any) {
+      attempts.push({ name: "rest-adimages", status: 0, body: String(e?.message ?? e) });
+    }
+
+    // Attempt 3: legacy ajax endpoint
+    try {
+      const form = new FormData();
+      const params: Record<string, string> = {
+        ...baseParams(c),
+        act: actNoPrefix,
+        source: "9",
+      };
+      for (const [k, v] of Object.entries(params)) form.append(k, v);
+      form.append("images[0]", new Blob([bytes], { type: mime }), data.fileName);
+      const res = await fetch(
+        `https://www.facebook.com/ajax/ads/adimage/upload.php?act=${actNoPrefix}`,
+        { method: "POST", headers: fbHeaders(c, "AdsImageUpload"), body: form },
+      );
+      const text = await res.text();
+      const parsed = parseFbResponse(text) as any;
+      const hash =
+        extractHash(parsed) ??
+        parsed?.payload?.images?.[0]?.hash ??
+        parsed?.payload?.hash ??
+        null;
+      if (hash) return { success: true, imageHash: hash, error: null };
+      attempts.push({ name: "legacy-ajax", status: res.status, body: text.slice(0, 400) });
+    } catch (e: any) {
+      attempts.push({ name: "legacy-ajax", status: 0, body: String(e?.message ?? e) });
+    }
+
+    const summary = attempts
+      .map((a) => `[${a.name} ${a.status}] ${a.body}`)
+      .join(" | ")
+      .slice(0, 800);
     return {
-      success: Boolean(imageHash),
-      imageHash,
-      error: imageHash ? null : (JSON.stringify(parsed?.errors ?? parsed).slice(0, 600) || "لم يتم إرجاع image_hash"),
+      success: false,
+      imageHash: null,
+      error: `فشلت كل محاولات الرفع. ${summary}`,
     };
   });
 
