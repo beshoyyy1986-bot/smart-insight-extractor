@@ -298,20 +298,22 @@ function Index() {
           <h2 className="font-display text-lg font-bold">⚙️ الإعدادات</h2>
 
           <div className="space-y-2">
-            <h3 className="text-sm font-bold text-primary">🔐 Cookie String</h3>
+            <h3 className="text-sm font-bold text-primary">🔐 المُدخل الذكي</h3>
             <p className="text-xs leading-6 text-muted-foreground">
-              افتح فيسبوك في المتصفح، ثم F12 ← Application ← Cookies، وانسخ الكوكيز بصيغة
-              <code className="mx-1 rounded bg-input px-1">name=value; name2=value2</code>
+              الصق أي شيء: كوكيز <code className="mx-1 rounded bg-input px-1">c_user=...; xs=...</code>،
+              أو أمر <code className="rounded bg-input px-1">curl</code> منسوخ من DevTools،
+              أو رابط مدير الإعلانات (<code className="rounded bg-input px-1">act=...</code>)، أو HTML خام من فيسبوك.
+              سنستخرج تلقائياً: UID، fb_dtsg، lsd، jazoest، وحتى act/page_id.
             </p>
             <textarea
               className="field h-32 resize-none font-mono text-xs"
               dir="ltr"
-              placeholder="c_user=123456789; xs=token; datr=value; ..."
+              placeholder={`c_user=100000...; xs=...; fr=...; datr=...\nأو: curl 'https://www.facebook.com/api/graphql/' -H 'cookie: ...' --data-raw '...&fb_dtsg=NAcM...'`}
               value={cookieInput}
               onChange={(e) => setCookieInput(e.target.value)}
             />
             <button className="btn-primary w-full" onClick={importCookies}>
-              🚀 استيراد Cookies
+              🚀 استخراج تلقائي
             </button>
           </div>
 
